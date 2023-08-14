@@ -3,7 +3,7 @@ import { SeleniumGridConstruct } from './index';
 
 const app = new cdk.App();
 const env = {
-  region: process.env.CDK_DEFAULT_REGION,
+  region: "sa-east-1", 
   account: process.env.CDK_DEFAULT_ACCOUNT,
 };
 
@@ -12,8 +12,9 @@ const stack = new cdk.Stack(app, 'testing-stack', { env });
 new SeleniumGridConstruct(stack, 'SeleniumHubCluster', {
   cpu: 1024,
   memory: 2048,
-  seleniumNodeMaxInstances: 500,
-  seleniumNodeMaxSessions: 500,
+  seleniumNodeMaxInstances: 2,
+  seleniumNodeMaxSessions: 2,
   minInstances: 1,
-  maxInstances: 10
+  maxInstances: 10,
+  chromeNode: true
 });

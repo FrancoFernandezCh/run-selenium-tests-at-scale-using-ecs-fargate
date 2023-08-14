@@ -10,7 +10,7 @@ export interface ISeleniumGridProps {
   // VPC
   readonly vpc?: ec2.IVpc;
 
-  // Selenium version to pull in, ex:3.141.59
+  // Selenium version to pull in, ex: 4.11
   readonly seleniumVersion?: string;
 
   // Memory settings for hub and chrome fargate nodes, ex: 512
@@ -30,12 +30,16 @@ export interface ISeleniumGridProps {
 
   // Auto-scale maximum number of instances
   readonly maxInstances?: number;
+
+  readonly chromeNode?: boolean;
+  readonly firefoxNode?: boolean;
+  readonly edgeNode?: boolean;
 }
 
 export interface IResourceDefinitionProps{
   cluster: ecs.Cluster;
   stack: cdk.Construct;
-  loadBalancer: elbv2.ApplicationLoadBalancer;
+  loadBalancer: elbv2.NetworkLoadBalancer;
   securityGroup: ec2.SecurityGroup;
   identifier: string;
   minInstances: number;
@@ -75,7 +79,7 @@ export class SeleniumGridConstruct extends cdk.Construct {
 
     // Create new VPC if it doesnt exist
     this.vpc = props.vpc ?? new ec2.Vpc(this, 'Vpc', { natGateways: 1 });
-    this.seleniumVersion = props.seleniumVersion ?? '3.141.59';
+    this.seleniumVersion = props.seleniumVersion ?? '4.11';
     this.memory = props.memory ?? 512;
     this.cpu = props.cpu ?? 256;
     this.seleniumNodeMaxInstances = props.seleniumNodeMaxInstances ?? 5;
@@ -92,14 +96,17 @@ export class SeleniumGridConstruct extends cdk.Construct {
     // Setup capacity providers and default strategy for cluster
     const cfnEcsCluster = cluster.node.defaultChild as ecs.CfnCluster;
     cfnEcsCluster.capacityProviders = ['FARGATE', 'FARGATE_SPOT'];
-    cfnEcsCluster.defaultCapacityProviderStrategy = [{
-      capacityProvider: 'FARGATE',
-      weight: 1,
-      base: 4,
-    }, {
-      capacityProvider: 'FARGATE_SPOT',
-      weight: 4,
-    }];
+    cfnEcsCluster.defaultCapacityProviderStrategy = [
+      {
+        capacityProvider: 'FARGATE',
+        weight: 1,
+        base: 4,
+      }, 
+      {
+        capacityProvider: 'FARGATE_SPOT',
+        weight: 4,
+      },
+    ];
 
     // Create security group and add inbound and outbound traffic ports
     var securityGroup = new ec2.SecurityGroup(this, 'security-group-selenium', {
@@ -107,16 +114,17 @@ export class SeleniumGridConstruct extends cdk.Construct {
       allowAllOutbound: true,
     });
 
-    // Open up port 4444 and 5555 for execution
+    // Open up port 4442, 4443, 4444 and 5555 for execution
+    securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(4442), 'Port 4442 for inbound traffic');
+    securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(4443), 'Port 4443 for inbound traffic');
     securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(4444), 'Port 4444 for inbound traffic');
     securityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(5555), 'Port 5555 for inbound traffic');
 
     // Setup Load balancer & register targets
-    var loadBalancer = new elbv2.ApplicationLoadBalancer(this, 'app-lb', {
+    var loadBalancer = new elbv2.NetworkLoadBalancer(this, 'network-lb', {
       vpc: this.vpc,
       internetFacing: true,
     });
-    loadBalancer.addSecurityGroup(securityGroup);
 
     // Register SeleniumHub resources
     this.createHubResources({
@@ -130,26 +138,42 @@ export class SeleniumGridConstruct extends cdk.Construct {
     });
 
     // Register Chrome node resources
-    this.createBrowserResource({
-      cluster: cluster,
-      identifier: 'chrome',
-      loadBalancer: loadBalancer,
-      securityGroup: securityGroup,
-      stack: this,
-      maxInstances: this.maxInstances,
-      minInstances: this.minInstances
-    }, 'selenium/node-chrome');
+    if (props.chromeNode != undefined && props.chromeNode)
+      this.createBrowserResource({
+        cluster: cluster,
+        identifier: 'chrome',
+        loadBalancer: loadBalancer,
+        securityGroup: securityGroup,
+        stack: this,
+        maxInstances: this.maxInstances,
+        minInstances: this.minInstances
+      }, 'selenium/node-chrome');
+
 
     // Register Firefox node resources
-    this.createBrowserResource({
-      cluster: cluster,
-      identifier: 'firefox',
-      loadBalancer: loadBalancer,
-      securityGroup: securityGroup,
-      stack: this,
-      maxInstances: this.maxInstances,
-      minInstances: this.minInstances
-    }, 'selenium/node-firefox');
+    if (props.firefoxNode != undefined && props.firefoxNode)
+      this.createBrowserResource({
+        cluster: cluster,
+        identifier: 'firefox',
+        loadBalancer: loadBalancer,
+        securityGroup: securityGroup,
+        stack: this,
+        maxInstances: this.maxInstances,
+        minInstances: this.minInstances
+      }, 'selenium/node-edge');
+
+    // Register Edge node resources
+    if (props.firefoxNode != undefined && props.firefoxNode)
+      this.createBrowserResource({
+        cluster: cluster,
+        identifier: 'firefox',
+        loadBalancer: loadBalancer,
+        securityGroup: securityGroup,
+        stack: this,
+        maxInstances: this.maxInstances,
+        minInstances: this.minInstances
+      }, 'selenium/node-firefox');
+
 
     new cdk.CfnOutput(this, 'LoadBalancerDNS', {
       exportName: 'Selenium-Hub-DNS',
@@ -161,11 +185,9 @@ export class SeleniumGridConstruct extends cdk.Construct {
     var service = this.createService({
       resource: options,
       env: {
-        GRID_BROWSER_TIMEOUT: '200000',
-        GRID_TIMEOUT: '180',
-        SE_OPTS: '-debug',
+        SE_SESSION_REQUEST_TIMEOUT: '180'
       },
-      image: 'selenium/hub:'+this.seleniumVersion,
+      image: 'selenium/hub:' + this.seleniumVersion,
     });
 
     // Create autoscaling policy
@@ -178,37 +200,63 @@ export class SeleniumGridConstruct extends cdk.Construct {
       maxInstances: options.maxInstances
     });
 
-    // Default target routing for 4444 so webdriver client can connect to
-    const listener = options.loadBalancer.addListener('Listener', { port: 4444, protocol: elbv2.ApplicationProtocol.HTTP });
-    service.registerLoadBalancerTargets({
-      containerName: 'selenium-hub-container',
-      containerPort: 4444,
-      newTargetGroupId: 'ECS',
-      protocol: ecs.Protocol.TCP,
-      listener: ecs.ListenerConfig.applicationListener(listener, {
-        protocol: elbv2.ApplicationProtocol.HTTP,
-        port: 4444,
-        targets: [service],
-      }),
-    });
+    // Creating listeners for load balancer in Selenium cluster
+    const listener4442 = options.loadBalancer.addListener('Listener4442', { port: 4442, protocol: elbv2.Protocol.TCP });
+    const listener4443 = options.loadBalancer.addListener('Listener4443', { port: 4443, protocol: elbv2.Protocol.TCP });
+    const listener4444 = options.loadBalancer.addListener('Listener4444', { port: 4444, protocol: elbv2.Protocol.TCP });
+
+    // Register lb targets
+    service.registerLoadBalancerTargets(
+      {
+        containerName: 'selenium-hub-container',
+        containerPort: 4442,
+        newTargetGroupId: 'ECS',
+        protocol: ecs.Protocol.TCP,
+        listener: ecs.ListenerConfig.networkListener(listener4442, {
+          port: 4442,
+          targets: [service],
+        }),
+      },
+      {
+        containerName: 'selenium-hub-container',
+        containerPort: 4443,
+        newTargetGroupId: 'ECS',
+        protocol: ecs.Protocol.TCP,
+        listener: ecs.ListenerConfig.networkListener(listener4443, {
+          port: 4443,
+          targets: [service],
+        }),
+      },
+      {
+        containerName: 'selenium-hub-container',
+        containerPort: 4444,
+        newTargetGroupId: 'ECS',
+        protocol: ecs.Protocol.TCP,
+        listener: ecs.ListenerConfig.networkListener(listener4444, {
+          port: 4444,
+          targets: [service],
+        }),
+      },
+    );
   }
 
   createBrowserResource(options: IResourceDefinitionProps, image: string) {
 
     // Env parameters configured to connect back to selenium hub when new nodes gets added
+    // https://www.webelement.click/en/selenium_grid_4_complete_guide_to_configuration_flags
     var service = this.createService({
       resource: options,
       env: {
-        HUB_PORT_4444_TCP_ADDR: options.loadBalancer.loadBalancerDnsName,
-        HUB_PORT_4444_TCP_PORT: '4444',
-        NODE_MAX_INSTANCES: this.seleniumNodeMaxInstances.toString(),
-        NODE_MAX_SESSION: this.seleniumNodeMaxSessions.toString(),
-        SE_OPTS: '-debug',
-        shm_size: '512',
+        SE_EVENT_BUS_HOST: options.loadBalancer.loadBalancerDnsName,
+        SE_EVENT_BUS_PUBLISH_PORT: '4442',
+        SE_EVENT_BUS_SUBSCRIBE_PORT: '4443',
+        SE_NODE_GRID_URL: 'http://'+options.loadBalancer.loadBalancerDnsName+':4444',
+        SE_NODE_SESSION_TIMEOUT: '600',
+        SE_NODE_OVERRIDE_MAX_SESSIONS: 'true',
+        SE_NODE_MAX_SESSIONS: this.seleniumNodeMaxSessions.toString(),
+        shm_size: "512",
       },
-      image: image+':'+this.seleniumVersion,
-      entryPoint: ['sh', '-c'],
-      command: ["PRIVATE=$(curl -s http://169.254.170.2/v2/metadata | jq -r '.Containers[0].Networks[0].IPv4Addresses[0]') ; export REMOTE_HOST=\"http://$PRIVATE:5555\"; export SE_OPTS=\"-host $PRIVATE -port 5555\" ; /opt/bin/entry_point.sh"],
+      image: image + ':' + this.seleniumVersion,
     });
 
     // Create autoscaling policy
@@ -246,12 +294,24 @@ export class SeleniumGridConstruct extends cdk.Construct {
       command: options.command,
     });
 
-    // Port mapping
-    containerDefinition.addPortMappings({
-      containerPort: 4444,
-      hostPort: 4444,
-      protocol: ecs.Protocol.TCP,
-    });
+    // Ports mapping
+    containerDefinition.addPortMappings(
+      {
+        containerPort: 4442,
+        hostPort: 4442,
+        protocol: ecs.Protocol.TCP,
+      },
+      {
+        containerPort: 4443,
+        hostPort: 4443,
+        protocol: ecs.Protocol.TCP,
+      },
+      {
+        containerPort: 4444,
+        hostPort: 4444,
+        protocol: ecs.Protocol.TCP,
+      },
+    );
 
     // Setup Fargate service
     return new ecs.FargateService(stack, 'selenium-'+identiifer+'-service', {
@@ -283,7 +343,7 @@ export class SeleniumGridConstruct extends cdk.Construct {
     const workerUtilizationMetric = new cloudwatch.Metric({
       namespace: 'AWS/ECS',
       metricName: 'CPUUtilization',
-      statistic: 'max',
+      statistic: 'avg',
       period: cdk.Duration.minutes(1),
       dimensions: {
         ClusterName: clusterName,
@@ -299,9 +359,9 @@ export class SeleniumGridConstruct extends cdk.Construct {
       adjustmentType: applicationautoscaling.AdjustmentType.CHANGE_IN_CAPACITY,      
       scalingSteps: [
         { upper: 30, change: -1 },
-        { lower: 80, change: +3 },
+        { lower: 70, change: +3 },
       ],    
-      cooldown: cdk.Duration.seconds(180),      
+      cooldown: cdk.Duration.seconds(180),     
     }); 
   }
 }
