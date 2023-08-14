@@ -9,7 +9,7 @@ describe('Play with google', () => {
     });
 
     it('start a search', () => {
-        $('input[aria-label="Search"]').setValue('https://github.com/hariohmprasath\n');
+        $('textarea[name="q"]').setValue('https://github.com/hariohmprasath\n');
         $('#extabar').waitForDisplayed(5000);
     });
 });
