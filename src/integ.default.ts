@@ -3,7 +3,7 @@ import { SeleniumGridConstruct } from './index';
 
 const app = new cdk.App();
 const env = {
-  region: "sa-east-1", 
+  region: process.env.CDK_DEFAULT_REGION,
   account: process.env.CDK_DEFAULT_ACCOUNT,
 };
 
